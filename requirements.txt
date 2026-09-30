@@ -1,0 +1,6 @@
+pyrogram==2.0.106
+tgcrypto==1.2.5
+qrcode==8.2
+pillow==12.1.1
+imap-tools==1.15.0
+fampay-verify==1.0.6
