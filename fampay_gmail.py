@@ -9,10 +9,39 @@ def verify_gmail_payment(gmail: str, app_password: str, amount, utr: str = "", t
     email_clean = gmail if "@" in gmail else f"{gmail}@gmail.com"
     app_password_clean = (app_password or "").replace(" ", "")
     expected_amount = float(amount)
+    # Build every plausible textual representation of the amount, since real
+    # bank/UPI emails are inconsistent about formatting:
+    #   487.0  (naive str(float), what we used to search for — rarely appears literally)
+    #   487    (whole-rupee amounts are usually shown with no decimals)
+    #   487.00 (two-decimal currency formatting)
+    #   1,250 / 1,250.00 (comma thousands separator, common for amounts >= 1000)
+    is_whole = expected_amount == int(expected_amount)
+    int_amt = int(expected_amount)
+    amount_variants = {str(expected_amount), f"{expected_amount:.2f}"}
+    if is_whole:
+        amount_variants.add(str(int_amt))
+        amount_variants.add(f"{int_amt:,}")
+        amount_variants.add(f"{int_amt:,}.00")
+    # Longest-first so e.g. "1,250.00" is tried before "1,250" (both would
+    # otherwise match the same text, order doesn't change correctness here,
+    # but keeps the pattern's intent clear).
+    amount_regex_part = "|".join(re.escape(v) for v in sorted(amount_variants, key=len, reverse=True))
+    amount_pattern = rf"(?:rs\.?|inr|₹|\s|^)(?:{amount_regex_part})(?:\s|$|\.|,|/-)"
+
     try:
         with MailBox("imap.gmail.com", 993).login(email_clean, app_password_clean, "INBOX") as mailbox:
-            search_val = utr or txnid or str(amount)
-            messages = list(mailbox.fetch(AND(text=search_val), reverse=True, limit=50))
+            if utr or txnid:
+                # Exact reference code — safe to let IMAP pre-filter by it.
+                search_val = utr or txnid
+                messages = list(mailbox.fetch(AND(text=search_val), reverse=True, limit=50))
+            else:
+                # No reference code to search by. IMAP's literal-substring TEXT
+                # search on a float-formatted amount (e.g. "487.0") very often
+                # does not appear verbatim in the email, silently returning zero
+                # results. Fetch recent messages unfiltered instead and let the
+                # amount regex below (which handles real formatting variants)
+                # do the actual matching.
+                messages = list(mailbox.fetch(reverse=True, limit=50))
             if not messages:
                 return VerificationResult(verified=False, message="Transaction not found")
             for msg in messages:
@@ -22,8 +51,7 @@ def verify_gmail_payment(gmail: str, app_password: str, amount, utr: str = "", t
                 if not utr and not txnid and msg.date:
                     if msg.date.timestamp() < datetime.now().timestamp() - 900:
                         continue
-                amount_pattern = rf"(?:rs\.?|inr|₹|\s|^){expected_amount}(?:\.00)?(?:\s|$|\.)"
-                if not (re.search(amount_pattern, full_text, re.IGNORECASE) or str(expected_amount) in full_text):
+                if not re.search(amount_pattern, full_text, re.IGNORECASE):
                     continue
                 sender_name = "UPI User"
                 name_match = re.search(r"(?:from|received from|sender)\s+([a-zA-Z ]{3,30})", full_text)
